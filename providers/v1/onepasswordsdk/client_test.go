@@ -592,7 +592,9 @@ type fakeLister struct {
 	listAllResult    []onepassword.ItemOverview
 	createCalled     bool
 	createdFieldType onepassword.ItemFieldType
+	createdParams    onepassword.ItemCreateParams
 	putCalled        bool
+	putItem          onepassword.Item
 	deleteCalled     bool
 	getResult        onepassword.Item
 	fileLister       onepassword.ItemsFilesAPI
@@ -600,6 +602,7 @@ type fakeLister struct {
 
 func (f *fakeLister) Create(ctx context.Context, params onepassword.ItemCreateParams) (onepassword.Item, error) {
 	f.createCalled = true
+	f.createdParams = params
 	if len(params.Fields) > 0 {
 		f.createdFieldType = params.Fields[0].FieldType
 	}
@@ -612,6 +615,7 @@ func (f *fakeLister) Get(ctx context.Context, vaultID, itemID string) (onepasswo
 
 func (f *fakeLister) Put(ctx context.Context, item onepassword.Item) (onepassword.Item, error) {
 	f.putCalled = true
+	f.putItem = item
 	return onepassword.Item{}, nil
 }
 
@@ -1428,4 +1432,93 @@ func TestIsNativeItemID(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestPushAllKeys(t *testing.T) {
+	fc := &fakeClient{listAllResult: []onepassword.VaultOverview{{ID: "vault-id", Title: "vault"}}}
+
+	existingItem := onepassword.Item{
+		ID: "item-id", Title: "existing-item", VaultID: "vault-id",
+		Fields: []onepassword.ItemField{
+			{ID: "old-key", Title: "old-key", Value: "old-val", FieldType: onepassword.ItemFieldTypeConcealed},
+		},
+	}
+
+	newLister := func(existing ...onepassword.Item) *fakeLister {
+		fl := &fakeLister{listAllResult: []onepassword.ItemOverview{}}
+		if len(existing) > 0 {
+			fl.getResult = existing[0]
+			fl.listAllResult = []onepassword.ItemOverview{{ID: existing[0].ID, Title: existing[0].Title, VaultID: existing[0].VaultID}}
+		}
+		return fl
+	}
+
+	fieldsMap := func(fields []onepassword.ItemField) map[string]onepassword.ItemField {
+		m := make(map[string]onepassword.ItemField, len(fields))
+		for _, f := range fields {
+			m[f.Title] = f
+		}
+		return m
+	}
+
+	ref := func(key, remoteKey string, meta ...string) v1alpha1.PushSecretData {
+		d := v1alpha1.PushSecretData{Match: v1alpha1.PushSecretMatch{SecretKey: key, RemoteRef: v1alpha1.PushSecretRemoteRef{RemoteKey: remoteKey}}}
+		if len(meta) > 0 {
+			raw := apiextensionsv1.JSON{Raw: []byte(meta[0])}
+			d.Metadata = &raw
+		}
+		return d
+	}
+
+	secret := func(kv ...string) *corev1.Secret {
+		s := &corev1.Secret{Data: map[string][]byte{}}
+		for i := 0; i+1 < len(kv); i += 2 {
+			s.Data[kv[i]] = []byte(kv[i+1])
+		}
+		return s
+	}
+
+	t.Run("creates new item with all secret keys as concealed fields", func(t *testing.T) {
+		fl := newLister()
+		p := &SecretsClient{client: &onepassword.Client{SecretsAPI: fc, VaultsAPI: fc, ItemsAPI: fl}, vaultID: "vault-id"}
+		require.NoError(t, p.PushSecret(t.Context(), secret("alpha", "val-alpha", "beta", "val-beta"), ref("", "my-item")))
+		require.True(t, fl.createCalled)
+		assert.False(t, fl.putCalled)
+		fm := fieldsMap(fl.createdParams.Fields)
+		assert.Equal(t, "val-alpha", fm["alpha"].Value)
+		assert.Equal(t, onepassword.ItemFieldTypeConcealed, fm["alpha"].FieldType)
+		assert.Equal(t, "val-beta", fm["beta"].Value)
+	})
+
+	t.Run("updates existing item with all secret keys", func(t *testing.T) {
+		fl := newLister(onepassword.Item{ID: "item-id", Title: "existing-item", VaultID: "vault-id"})
+		p := &SecretsClient{client: &onepassword.Client{SecretsAPI: fc, VaultsAPI: fc, ItemsAPI: fl}, vaultID: "vault-id"}
+		require.NoError(t, p.PushSecret(t.Context(), secret("key1", "value1", "key2", "value2"), ref("", "existing-item")))
+		assert.False(t, fl.createCalled)
+		require.True(t, fl.putCalled)
+		fm := fieldsMap(fl.putItem.Fields)
+		assert.Equal(t, "value1", fm["key1"].Value)
+		assert.Equal(t, "value2", fm["key2"].Value)
+	})
+
+	t.Run("applies tags from metadata on create", func(t *testing.T) {
+		fl := newLister()
+		p := &SecretsClient{client: &onepassword.Client{SecretsAPI: fc, VaultsAPI: fc, ItemsAPI: fl}, vaultID: "vault-id"}
+		meta := `{"apiVersion":"kubernetes.external-secrets.io/v1alpha1","kind":"PushSecretMetadata","spec":{"tags":["env:prod","team:backend"]}}`
+		require.NoError(t, p.PushSecret(t.Context(), secret("k", "v"), ref("", "tagged-item", meta)))
+		require.True(t, fl.createCalled)
+		assert.Equal(t, []string{"env:prod", "team:backend"}, fl.createdParams.Tags)
+	})
+
+	t.Run("removes fields deleted from the secret", func(t *testing.T) {
+		fl := newLister(existingItem) // existingItem has field "old-key"
+		p := &SecretsClient{client: &onepassword.Client{SecretsAPI: fc, VaultsAPI: fc, ItemsAPI: fl}, vaultID: "vault-id"}
+		// secret no longer contains "old-key", only "new-key"
+		require.NoError(t, p.PushSecret(t.Context(), secret("new-key", "new-val"), ref("", "existing-item")))
+		require.True(t, fl.putCalled)
+		fm := fieldsMap(fl.putItem.Fields)
+		assert.Equal(t, "new-val", fm["new-key"].Value, "new field must be added")
+		_, stillThere := fm["old-key"]
+		assert.False(t, stillThere, "deleted key must be removed from the 1Password item")
+	})
 }

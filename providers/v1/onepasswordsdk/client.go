@@ -402,6 +402,10 @@ func generateNewItemField(title, newVal string, fieldType onepassword.ItemFieldT
 
 // PushSecret creates or updates a secret in 1Password.
 func (p *SecretsClient) PushSecret(ctx context.Context, secret *corev1.Secret, ref esv1.PushSecretData) error {
+	if ref.GetSecretKey() == "" {
+		return p.pushAllKeys(ctx, secret, ref)
+	}
+
 	val, ok := secret.Data[ref.GetSecretKey()]
 	if !ok {
 		return fmt.Errorf("secret %s/%s does not contain a key", secret.Namespace, secret.Name)
@@ -421,9 +425,6 @@ func (p *SecretsClient) PushSecret(ctx context.Context, secret *corev1.Secret, r
 
 	providerItem.Fields = normalizeItemFields(providerItem.Fields)
 
-	// TODO: We are only sending info to a specific label on a 1password item.
-	// We should change this logic eventually to allow pushing whole kubernetes Secrets to 1password as multiple labels
-	// OOTB.
 	label := ref.GetProperty()
 	if label == "" {
 		label = "password"
@@ -456,6 +457,74 @@ func (p *SecretsClient) PushSecret(ctx context.Context, secret *corev1.Secret, r
 	p.invalidateCacheByPrefix(p.constructRefKey(title))
 	p.invalidateItemCache(title)
 
+	return nil
+}
+
+// pushAllKeys pushes all keys from secret.Data as separate fields on a single 1Password item.
+func (p *SecretsClient) pushAllKeys(ctx context.Context, secret *corev1.Secret, ref esv1.PushSecretData) error {
+	mdata, err := metadata.ParseMetadataParameters[PushSecretMetadataSpec](ref.GetMetadata())
+	if err != nil {
+		return fmt.Errorf("failed to parse push secret metadata: %w", err)
+	}
+
+	var tags []string
+	if mdata != nil && mdata.Spec.Tags != nil {
+		tags = mdata.Spec.Tags
+	}
+
+	title := ref.GetRemoteKey()
+	providerItem, err := p.findItem(ctx, title)
+
+	if errors.Is(err, ErrKeyNotFound) {
+		var fields []onepassword.ItemField
+		for k, v := range secret.Data {
+			fields = append(fields, generateNewItemField(k, string(v), onepassword.ItemFieldTypeConcealed))
+		}
+		_, err = p.client.Items().Create(ctx, onepassword.ItemCreateParams{
+			Category: onepassword.ItemCategoryServer,
+			VaultID:  p.vaultID,
+			Title:    title,
+			Fields:   fields,
+			Tags:     tags,
+		})
+		metrics.ObserveAPICall(constants.ProviderOnePasswordSDK, constants.CallOnePasswordSDKItemsCreate, err)
+		if err != nil {
+			return fmt.Errorf("failed to create item: %w", err)
+		}
+		p.invalidateCacheByPrefix(p.constructRefKey(title))
+		p.invalidateItemCache(title)
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("failed to find item: %w", err)
+	}
+
+	providerItem.Fields = normalizeItemFields(providerItem.Fields)
+	if mdata != nil && mdata.Spec.Tags != nil {
+		providerItem.Tags = mdata.Spec.Tags
+	}
+	// Rebuild fields: keep only those still present in secret.Data (deletions are reflected),
+	// updating values in place, then append any new keys.
+	kept := providerItem.Fields[:0]
+	for _, f := range providerItem.Fields {
+		if v, ok := secret.Data[f.Title]; ok {
+			f.Value = string(v)
+			kept = append(kept, f)
+		}
+	}
+	for k, v := range secret.Data {
+		if countFieldsWithLabel(k, kept) == 0 {
+			kept = append(kept, generateNewItemField(k, string(v), onepassword.ItemFieldTypeConcealed))
+		}
+	}
+	providerItem.Fields = kept
+	_, err = p.client.Items().Put(ctx, providerItem)
+	metrics.ObserveAPICall(constants.ProviderOnePasswordSDK, constants.CallOnePasswordSDKItemsPut, err)
+	if err != nil {
+		return fmt.Errorf("failed to update item: %w", err)
+	}
+	p.invalidateCacheByPrefix(p.constructRefKey(title))
+	p.invalidateItemCache(title)
 	return nil
 }
 

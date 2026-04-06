@@ -59,7 +59,8 @@ func isNativeItemID(s string) bool {
 
 // PushSecretMetadataSpec defines the metadata configuration for pushing secrets to 1Password.
 type PushSecretMetadataSpec struct {
-	Tags []string `json:"tags,omitempty"`
+	Tags      []string `json:"tags,omitempty"`
+	FieldType string   `json:"fieldType,omitempty"`
 }
 
 // GetSecret returns a single secret from 1Password provider.
@@ -100,6 +101,8 @@ func (p *SecretsClient) DeleteSecret(ctx context.Context, ref esv1.PushSecretRem
 	if err != nil {
 		return err
 	}
+
+	providerItem.Fields = normalizeItemFields(providerItem.Fields)
 
 	var deleted bool
 	providerItem.Fields, deleted, err = deleteField(providerItem.Fields, ref.GetProperty())
@@ -296,12 +299,17 @@ func (p *SecretsClient) createItem(ctx context.Context, val []byte, ref esv1.Pus
 		tags = mdata.Spec.Tags
 	}
 
+	fieldType := onepassword.ItemFieldTypeConcealed
+	if mdata != nil {
+		fieldType = resolveFieldType(mdata.Spec.FieldType)
+	}
+
 	_, err = p.client.Items().Create(ctx, onepassword.ItemCreateParams{
 		Category: onepassword.ItemCategoryServer,
 		VaultID:  p.vaultID,
 		Title:    ref.GetRemoteKey(),
 		Fields: []onepassword.ItemField{
-			generateNewItemField(label, string(val)),
+			generateNewItemField(label, string(val), fieldType),
 		},
 		Tags: tags,
 	})
@@ -317,10 +325,10 @@ func (p *SecretsClient) createItem(ctx context.Context, val []byte, ref esv1.Pus
 }
 
 // updateFieldValue updates the fields value of an item with the given label.
-// If the label does not exist, a new field is created. If the label exists but
+// If the label does not exist, a new field is created with the given fieldType. If the label exists but
 // the value is different, the value is updated. If the label exists and the
 // value is the same, nothing is done.
-func updateFieldValue(fields []onepassword.ItemField, title, newVal string) ([]onepassword.ItemField, error) {
+func updateFieldValue(fields []onepassword.ItemField, title, newVal string, fieldType onepassword.ItemFieldType) ([]onepassword.ItemField, error) {
 	// This will always iterate over all items.
 	// This is done to ensure that two fields with the same label
 	// exist resulting in undefined behavior.
@@ -338,7 +346,7 @@ func updateFieldValue(fields []onepassword.ItemField, title, newVal string) ([]o
 		}
 	}
 	if !found {
-		return append(fields, generateNewItemField(title, newVal)), nil
+		return append(fields, generateNewItemField(title, newVal, fieldType)), nil
 	}
 
 	if fields[index].Value != newVal {
@@ -348,15 +356,48 @@ func updateFieldValue(fields []onepassword.ItemField, title, newVal string) ([]o
 	return fields, nil
 }
 
-// generateNewItemField generates a new item field with the given label and value.
-func generateNewItemField(title, newVal string) onepassword.ItemField {
-	field := onepassword.ItemField{
+// resolveFieldType maps a 1Password field type name to the SDK constant.
+// Case-insensitive. Accepted: text|string, concealed|password, url, email, phone, date, monthYear.
+// Defaults to Concealed for empty/unrecognized. OTP and file excluded.
+// Reference: https://developer.1password.com/docs/cli/item-fields/#custom-fields
+func resolveFieldType(raw string) onepassword.ItemFieldType {
+	switch strings.ToLower(raw) {
+	case "text", "string":
+		return onepassword.ItemFieldTypeText
+	case "concealed", "password":
+		return onepassword.ItemFieldTypeConcealed
+	case "email":
+		return onepassword.ItemFieldTypeEmail
+	case "url":
+		return onepassword.ItemFieldTypeURL
+	case "phone":
+		return onepassword.ItemFieldTypePhone
+	case "date":
+		return onepassword.ItemFieldTypeDate
+	case "monthyear":
+		return onepassword.ItemFieldTypeMonthYear
+	}
+	return onepassword.ItemFieldTypeConcealed
+}
+
+// normalizeItemFields clears empty section IDs because the 1Password SDK rejects items with a SectionID pointer to "" when the section is missing.
+func normalizeItemFields(fields []onepassword.ItemField) []onepassword.ItemField {
+	for i := range fields {
+		if fields[i].SectionID != nil && *fields[i].SectionID == "" {
+			fields[i].SectionID = nil
+		}
+	}
+	return fields
+}
+
+// generateNewItemField creates an ItemField with ID and Title set to the given title (unique within item), value, and field type.
+func generateNewItemField(title, newVal string, fieldType onepassword.ItemFieldType) onepassword.ItemField {
+	return onepassword.ItemField{
+		ID:        title,
 		Title:     title,
 		Value:     newVal,
-		FieldType: onepassword.ItemFieldTypeConcealed,
+		FieldType: fieldType,
 	}
-
-	return field
 }
 
 // PushSecret creates or updates a secret in 1Password.
@@ -378,6 +419,8 @@ func (p *SecretsClient) PushSecret(ctx context.Context, secret *corev1.Secret, r
 		return fmt.Errorf("failed to find item: %w", err)
 	}
 
+	providerItem.Fields = normalizeItemFields(providerItem.Fields)
+
 	// TODO: We are only sending info to a specific label on a 1password item.
 	// We should change this logic eventually to allow pushing whole kubernetes Secrets to 1password as multiple labels
 	// OOTB.
@@ -394,7 +437,12 @@ func (p *SecretsClient) PushSecret(ctx context.Context, secret *corev1.Secret, r
 		providerItem.Tags = mdata.Spec.Tags
 	}
 
-	providerItem.Fields, err = updateFieldValue(providerItem.Fields, label, string(val))
+	fieldType := onepassword.ItemFieldTypeConcealed
+	if mdata != nil {
+		fieldType = resolveFieldType(mdata.Spec.FieldType)
+	}
+
+	providerItem.Fields, err = updateFieldValue(providerItem.Fields, label, string(val), fieldType)
 	if err != nil {
 		return fmt.Errorf("failed to update field with label: %s: %w", label, err)
 	}
@@ -484,9 +532,27 @@ func (p *SecretsClient) findItem(ctx context.Context, name string) (onepassword.
 	return item, nil
 }
 
-// SecretExists checks if a secret exists in 1Password.
-func (p *SecretsClient) SecretExists(_ context.Context, _ esv1.PushSecretRemoteRef) (bool, error) {
-	return false, fmt.Errorf("not implemented")
+// SecretExists returns true if the item exists, and if property is specified, if a field with that title exists.
+func (p *SecretsClient) SecretExists(ctx context.Context, ref esv1.PushSecretRemoteRef) (bool, error) {
+	item, err := p.findItem(ctx, ref.GetRemoteKey())
+	if errors.Is(err, ErrKeyNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+
+	property := ref.GetProperty()
+	if property == "" {
+		return true, nil
+	}
+
+	for _, f := range item.Fields {
+		if f.Title == property {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // Validate does nothing here. It would be possible to ping the SDK to prove we're healthy, but
